@@ -4,15 +4,8 @@
 #include "rectangle.h"
 #include "circle.h"
 #include <vector>
-#include <algorithm>
-
-constexpr float PLAYER_BULLET_SPEED{500.0f};
-constexpr float ENEMY_BULLET_SPEED{PLAYER_BULLET_SPEED / 5.0f}; // 100 px/s
-constexpr float PLAYER_FIRE_PERIOD{0.3f};
-constexpr float BULLET_RADIUS{10.0f};
-
-float fireTimer{0.0f};
-bool fireHeld{false};
+#include <cmath>     // NEW
+#include <algorithm> // NEW
 
 // define window dimensions
 constexpr int WINDOW_WIDTH{700};
@@ -46,6 +39,23 @@ Rectangle Enemy1, Enemy2, Enemy3;
 std::vector<Circle> BulletPlayer, BulletEnemy;
 Circle circle;
 
+// ---------------- NEW: bullet / enemy / game state ----------------
+constexpr float PLAYER_BULLET_SPEED{500.0f};
+constexpr float ENEMY_BULLET_SPEED{PLAYER_BULLET_SPEED / 5.0f}; // 100 px/s
+constexpr float PLAYER_FIRE_PERIOD{0.3f};
+constexpr float ENEMY_FIRE_PERIOD{PLAYER_FIRE_PERIOD * 10.0f}; // 3 s
+constexpr float ENEMY_FIRST_SHOT{1.0f};
+constexpr float BULLET_RADIUS{10.0f};
+
+float fireTimer{0.0f};
+
+Rectangle *Enemies[3]{&Enemy1, &Enemy2, &Enemy3}; // lets loops reach your Enemy1/2/3
+bool enemyAlive[3]{true, true, true};
+float enemyCooldown[3]{ENEMY_FIRST_SHOT, ENEMY_FIRST_SHOT, ENEMY_FIRST_SHOT};
+
+bool gameOver{false};
+// -------------------------------------------------------------------
+
 void EdgeCheck(Rectangle &rectangle)
 {
     if (rectangle.pos.x > WINDOW_WIDTH)
@@ -75,18 +85,19 @@ void initShape()
     EdgeCheck(Enemy3);
 }
 
+// CHANGED: only the NEW bullet gets its position/color/radius/velocity
+// (before, every click moved all existing bullets back to the mouse)
 void Create()
 {
     SDL_GetMouseState(&mouseX, &mouseY);
     BulletPlayer.push_back(circle);
     // define bullets
-    for (int i = 0; i < BulletPlayer.size(); i++)
-    {
-        BulletPlayer[i].color = SDL_Color(255, 0, 0, 255);
-        BulletPlayer[i].radius = 10;
-        BulletPlayer[i].pos.x = mouseX;
-        BulletPlayer[i].pos.y = mouseY - 30;
-    }
+    Circle &b = BulletPlayer.back();
+    b.color = SDL_Color(255, 0, 0, 255);
+    b.radius = BULLET_RADIUS;
+    b.pos.x = mouseX;
+    b.pos.y = mouseY - 30;
+    b.vel = glm::vec2(0.0f, -1.0f) * PLAYER_BULLET_SPEED; // NEW: direction (length 1) * speed
 }
 
 void initScollingRectangles()
@@ -156,63 +167,152 @@ bool initWindow()
     return success;
 }
 
-void spawnPlayerBullet()
+// CHANGED: was "if (DT = 0.3f)", which overwrote DT. Now it fires only
+// when the fire timer has run out.
+void Up()
 {
-    Circle bullet;
-    bullet.radius = BULLET_RADIUS;
-    bullet.color = SDL_Color(255, 0, 0, 255);
-    bullet.pos = Player.pos;
-    bullet.vel = glm::vec2(0.0f, -1.0f) * PLAYER_BULLET_SPEED; // direction (length 1) * speed
-    BulletPlayer.push_back(bullet);
+    if (fireTimer <= 0.0f)
+    {
+        Create();
+        fireTimer = PLAYER_FIRE_PERIOD;
+    }
 }
 
+// CHANGED: same name, now moves every bullet by velocity * DT and removes
+// the ones that left the window
+void speed()
+{
+    for (int i = 0; i < BulletPlayer.size(); i++)
+        BulletPlayer[i].pos += BulletPlayer[i].vel * DT;
+    for (int i = 0; i < BulletEnemy.size(); i++)
+        BulletEnemy[i].pos += BulletEnemy[i].vel * DT;
+
+    auto offscreen = [](const Circle &b)
+    {
+        return b.pos.x < -BULLET_RADIUS || b.pos.x > WINDOW_WIDTH + BULLET_RADIUS ||
+               b.pos.y < -BULLET_RADIUS || b.pos.y > WINDOW_HEIGHT + BULLET_RADIUS;
+    };
+    BulletPlayer.erase(std::remove_if(BulletPlayer.begin(), BulletPlayer.end(), offscreen), BulletPlayer.end());
+    BulletEnemy.erase(std::remove_if(BulletEnemy.begin(), BulletEnemy.end(), offscreen), BulletEnemy.end());
+}
+
+// ---------------- NEW: enemy fire, hitboxes, game flow ----------------
 void spawnEnemyBullet(const Rectangle &enemy)
 {
-    Circle bullet;
-    bullet.radius = BULLET_RADIUS;
-    bullet.color = SDL_Color(255, 0, 255, 255);
-    bullet.pos = enemy.pos;
+    Circle b = circle;
+    b.color = SDL_Color(255, 0, 255, 255);
+    b.radius = BULLET_RADIUS;
+    b.pos = enemy.pos;
 
     glm::vec2 dir = Player.pos - enemy.pos;
     if (glm::length(dir) > 0.0001f)
-        dir = glm::normalize(dir); // aimed once, here, at firing time
+        dir = glm::normalize(dir); // aimed once, when fired
     else
         dir = glm::vec2(0.0f, 1.0f);
-    bullet.vel = dir * ENEMY_BULLET_SPEED;
-    BulletEnemy.push_back(bullet);
+    b.vel = dir * ENEMY_BULLET_SPEED;
+    BulletEnemy.push_back(b);
 }
 
 void updateFiring()
 {
-    const SDL_MouseButtonFlags buttons = SDL_GetMouseState(nullptr, nullptr);
-    const bool lmbDown = (buttons & SDL_BUTTON_MASK(SDL_BUTTON_LEFT)) != 0;
+    // player: timer counts down, LMB held keeps firing
+    fireTimer = std::max(0.0f, fireTimer - DT);
+    if (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_MASK(SDL_BUTTON_LEFT))
+        Up();
 
-    if (lmbDown)
+    // enemies: first shot after 1 s, then every 3 s
+    for (int i = 0; i < 3; i++)
     {
-        fireTimer -= DT;
-        while (fireTimer <= 0.0f)
+        if (!enemyAlive[i])
+            continue;
+        enemyCooldown[i] -= DT;
+        if (enemyCooldown[i] <= 0.0f)
         {
-            spawnPlayerBullet();
-            fireTimer += PLAYER_FIRE_PERIOD;
+            spawnEnemyBullet(*Enemies[i]);
+            enemyCooldown[i] += ENEMY_FIRE_PERIOD;
         }
     }
-    else
-        fireTimer = 0.0f; // next press fires immediately
 }
 
-void moveBullets(std::vector<Circle> &bullets)
+// circle vs 50x50 box: clamp circle center into the box, compare distance with radius
+bool circleHitsRect(const Circle &c, const Rectangle &r)
 {
-    for (Circle &b : bullets)
-        b.pos += b.vel * DT; // pixels/second * seconds
-
-    bullets.erase(std::remove_if(bullets.begin(), bullets.end(),
-                                 [](const Circle &b)
-                                 {
-                                     return b.pos.x < -BULLET_RADIUS || b.pos.x > WINDOW_WIDTH + BULLET_RADIUS ||
-                                            b.pos.y < -BULLET_RADIUS || b.pos.y > WINDOW_HEIGHT + BULLET_RADIUS;
-                                 }),
-                  bullets.end());
+    glm::vec2 half(r.width / 2.0f, r.height / 2.0f);
+    glm::vec2 closest = glm::clamp(c.pos, r.pos - half, r.pos + half);
+    glm::vec2 d = c.pos - closest;
+    return glm::dot(d, d) <= c.radius * c.radius;
 }
+
+// box vs box
+bool rectHitsRect(const Rectangle &a, const Rectangle &b)
+{
+    return std::abs(a.pos.x - b.pos.x) < (a.width + b.width) / 2.0f &&
+           std::abs(a.pos.y - b.pos.y) < (a.height + b.height) / 2.0f;
+}
+
+void endGame(bool win)
+{
+    gameOver = true;
+    Player.color = win ? SDL_Color(0, 0, 255, 255) : SDL_Color(255, 0, 0, 255);
+    for (int i = 0; i < 3; i++)
+        enemyAlive[i] = false;
+    BulletPlayer.clear();
+    BulletEnemy.clear();
+}
+
+void resetGame()
+{
+    BulletPlayer.clear();
+    BulletEnemy.clear();
+    fireTimer = 0.0f;
+    for (int i = 0; i < 3; i++)
+    {
+        enemyAlive[i] = true;
+        enemyCooldown[i] = ENEMY_FIRST_SHOT;
+    }
+    gameOver = false;
+    initShape(); // new enemy positions + player color back to green
+}
+
+void checkCollisions()
+{
+    // player bullets vs enemies: both disappear
+    for (int i = (int)BulletPlayer.size() - 1; i >= 0; i--)
+    {
+        for (int j = 0; j < 3; j++)
+        {
+            if (enemyAlive[j] && circleHitsRect(BulletPlayer[i], *Enemies[j]))
+            {
+                enemyAlive[j] = false;
+                BulletPlayer.erase(BulletPlayer.begin() + i);
+                break;
+            }
+        }
+    }
+
+    if (!enemyAlive[0] && !enemyAlive[1] && !enemyAlive[2])
+    {
+        endGame(true); // win
+        return;
+    }
+
+    // enemy touches player
+    for (int j = 0; j < 3; j++)
+        if (enemyAlive[j] && rectHitsRect(Player, *Enemies[j]))
+        {
+            endGame(false);
+            return;
+        }
+
+    // enemy bullet hits player
+    for (int i = 0; i < BulletEnemy.size(); i++)
+        if (circleHitsRect(BulletEnemy[i], Player))
+        {
+            endGame(false);
+            return;
+        }
+}
+// ----------------------------------------------------------------------
 
 void processEvents()
 {
@@ -231,11 +331,8 @@ void processEvents()
             if (currentEvent.button.button == SDL_BUTTON_LEFT)
             {
                 SDL_GetMouseState(&mouseX, &mouseY);
-                if (currentEvent.type == SDL_EVENT_MOUSE_BUTTON_DOWN && currentEvent.button.button == SDL_BUTTON_LEFT)
-                    fireHeld = true;
-
-                if (currentEvent.type == SDL_EVENT_MOUSE_BUTTON_UP && currentEvent.button.button == SDL_BUTTON_LEFT)
-                    fireHeld = false;
+                if (!gameOver) // NEW
+                    Up();
                 mouseX /= displayScale;
                 mouseY /= displayScale;
                 std::cout << "Left mouse click => " << "x: " << mouseX << ", y: " << mouseY << std::endl;
@@ -273,6 +370,8 @@ void processEvents()
                 break;
             case SDLK_R:
                 std::cout << "R key was pressed" << std::endl;
+                if (gameOver) // NEW: reset only after the game ended
+                    resetGame();
                 break;
             case SDLK_S:
                 std::cout << "S key was pressed" << std::endl;
@@ -309,6 +408,11 @@ void MouseMovement()
     SDL_GetMouseState(&mouseX, &mouseY);
     Player.pos.x = mouseX;
     Player.pos.y = mouseY;
+
+    // NEW: keep the ship inside the window
+    const float half = Player.width / 2.0f;
+    Player.pos.x = glm::clamp(Player.pos.x, half, WINDOW_WIDTH - half);
+    Player.pos.y = glm::clamp(Player.pos.y, half, WINDOW_HEIGHT - half);
 }
 
 void drawFrame()
@@ -319,11 +423,16 @@ void drawFrame()
 
     // Draw scene
     Player.draw(renderer);
-    Enemy1.draw(renderer);
-    Enemy2.draw(renderer);
-    Enemy3.draw(renderer);
+    if (enemyAlive[0])
+        Enemy1.draw(renderer); // CHANGED: only living enemies
+    if (enemyAlive[1])
+        Enemy2.draw(renderer);
+    if (enemyAlive[2])
+        Enemy3.draw(renderer);
     for (int i = 0; i < BulletPlayer.size(); i++)
         BulletPlayer[i].draw(renderer);
+    for (int i = 0; i < BulletEnemy.size(); i++) // NEW
+        BulletEnemy[i].draw(renderer);
 
     // Draw scrolling grid
 
@@ -380,10 +489,13 @@ int main()
         startTime = SDL_GetTicks();
 
         processEvents();
-        MouseMovement();
-        updateFiring();
-        moveBullets(BulletPlayer);
-        moveBullets(BulletEnemy);
+        if (!gameOver) // NEW: everything game-related freezes after win/loss
+        {
+            MouseMovement();
+            updateFiring();
+            speed();
+            checkCollisions();
+        }
         animate();
         drawFrame();
 
